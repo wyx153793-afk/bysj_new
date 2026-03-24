@@ -1,12 +1,14 @@
 """
 JSP Environment for Train Timetabling Problem
+(Modified to include Integrated Optimization Objective and Constraints from the Paper)
 """
 import torch
 import numpy as np
 
 class JSP_Env:
     def __init__(self, n_jobs, n_machines, processing_time_matrix,
-                 job_op_sequences, device='cuda'):
+                 job_op_sequences, train_priorities=None, station_capacities=None,
+                 planned_departures=None, min_stop_times=None, device='cuda'):
         self.n_jobs = n_jobs
         self.n_machines = n_machines
         self.device = device
@@ -18,7 +20,7 @@ class JSP_Env:
 
         # 追踪与天窗基础参数
         self.min_headway_maintenance = 120 # 天窗列车安全间隔 120min
-        self.maintenance_job_ids = [8, 9]  # T9, T10 为天窗列车
+        self.maintenance_job_ids = [8, 9]  # 假设 T9, T10 为天窗列车
 
         # 间隔时间约束
         self.tau_bu = 3
@@ -34,6 +36,20 @@ class JSP_Env:
             4: (4, 3), 5: (3, 2), 6: (2, 1), 7: (1, 0)
         }
 
+        # --- 新增：论文中的参数与约束设定 ---
+        # 1. 列车等级权重 Wi (用于 Z1 目标函数)
+        self.W = train_priorities if train_priorities is not None else np.ones(n_jobs)
+
+        # 2. 车站到发线容量 DF_q (用于到发线约束)
+        self.station_capacities = station_capacities if station_capacities is not None else {i: 2 for i in range(5)}
+
+        # 3. 计划始发时间 T_Oi (用于 3.8 始发时间域约束)
+        self.planned_departures = planned_departures
+
+        # 4. 列车在车站的最短停站/技术作业时间 S_{i,q} (用于 3.9 约束)
+        # 格式: [n_jobs, n_stations]
+        self.min_stop_times = min_stop_times if min_stop_times is not None else np.zeros((n_jobs, 5))
+
         self.reset()
 
     def reset(self):
@@ -47,12 +63,18 @@ class JSP_Env:
         self.completed_jobs = np.zeros(self.n_jobs, dtype=bool)
         self.schedule = {}
 
+        # 记录实际始发时间，用于计算 Z2 (发车密度)
+        self.actual_departures = np.zeros(self.n_jobs)
+
         self.station_records = {i: [] for i in range(5)}
         self.section_records = {i: [] for i in range(8)}
 
         return self.get_state()
 
     def check_capacity_violation(self, st, new_start, new_end):
+        """
+        判断车站 st 是否超过到发线容量 DF_q (约束 3.11 / 4.10)
+        """
         events = []
         for s, e in self.station_records[st]:
             if e > s:
@@ -69,7 +91,9 @@ class JSP_Env:
             current += change
             if current > max_concurrent:
                 max_concurrent = current
-        return max_concurrent > 2
+
+        # 使用动态的车站容量而不是硬编码的 2
+        return max_concurrent > self.station_capacities.get(st, 2)
 
     def get_state(self):
         ready_ops_features = []
@@ -116,11 +140,6 @@ class JSP_Env:
             return 0
         return max(regular_jobs_ready_time)
 
-    def _compute_reward(self):
-        if np.all(self.completed_jobs):
-            return -self.get_makespan() / 100.0
-        return 0.0
-
     def step(self, job_id):
         op_idx = self.current_op_idx[job_id]
         machine_id = self.op_machine_assign[job_id, op_idx]
@@ -129,8 +148,20 @@ class JSP_Env:
         opp_machine_id = 7 - machine_id
         is_curr_maintenance = (job_id in self.maintenance_job_ids)
 
-        start_time = self.job_ready_time[job_id]
+        ready_t = self.job_ready_time[job_id]
+        start_st, end_st = self.machine_to_stations[machine_id]
 
+        # --- 约束 3.9：叠加在车站的技术作业时间 S_{i,q} ---
+        min_stop = self.min_stop_times[job_id, start_st] if op_idx > 0 else 0
+        start_time = ready_t + min_stop
+
+        # --- 约束 3.8：始发时间域约束 (仅针对列车的第一个区间) ---
+        if op_idx == 0 and self.planned_departures is not None and not is_curr_maintenance:
+            planned_t = self.planned_departures[job_id]
+            # 最早出发时间限制：不能早于 planned_t - 60
+            start_time = max(start_time, planned_t - 60)
+
+        # 追踪与越行逻辑 (约束 3.5, 3.6)
         last_j = self.machine_last_job[machine_id]
         if last_j != -1:
             last_enter = self.machine_last_enter_time[machine_id]
@@ -143,11 +174,13 @@ class JSP_Env:
                 hw = max(self.tau_lian, self.tau_fadao) if dir_curr == dir_last else max(self.tau_bu, self.tau_hui, self.tau_tong)
                 start_time = max(start_time, last_enter + hw)
 
+        # 天窗互斥约束
         if is_curr_maintenance:
             last_j_opp = self.machine_last_job[opp_machine_id]
             if last_j_opp != -1:
                 start_time = max(start_time, self.machine_last_leave_time[opp_machine_id])
 
+        # 冲突检测循环
         conflict = True
         while conflict:
             conflict = False
@@ -186,16 +219,23 @@ class JSP_Env:
                         break
 
         end_time = start_time + proc_time
+
+        # 记录避让等待时间 y_{i,q}
+        waiting_time = max(0, start_time - ready_t - min_stop)
         step_penalty = 0.0
 
-        start_st, end_st = self.machine_to_stations[machine_id]
-        waiting_start = self.job_ready_time[job_id]
-        waiting_end = start_time
+        # --- 到发线约束判定 (约束 3.10, 3.11) ---
+        if start_time > ready_t:
+            if self.check_capacity_violation(start_st, ready_t, start_time):
+                step_penalty -= 500.0  # 到发线超限，施加严重惩罚
+            self.station_records[start_st].append((ready_t, start_time))
 
-        if waiting_end > waiting_start:
-            if self.check_capacity_violation(start_st, waiting_start, waiting_end):
-                step_penalty -= 500.0
-            self.station_records[start_st].append((waiting_start, waiting_end))
+        # 始发时间晚点惩罚 (软约束强化 3.8 约束)
+        if op_idx == 0 and self.planned_departures is not None and not is_curr_maintenance:
+            self.actual_departures[job_id] = start_time
+            planned_t = self.planned_departures[job_id]
+            if start_time > planned_t + 60:
+                step_penalty -= (start_time - (planned_t + 60)) * 2.0  # 超出上界时惩罚
 
         self.section_records[machine_id].append((start_time, end_time, job_id))
 
@@ -204,6 +244,7 @@ class JSP_Env:
 
         self.schedule[(job_id, op_idx)] = (machine_id, start_time, end_time)
 
+        # 状态更新
         self.machine_last_job[machine_id] = job_id
         self.machine_last_leave_time[machine_id] = end_time
         self.machine_last_enter_time[machine_id] = start_time
@@ -225,8 +266,31 @@ class JSP_Env:
                 self.op_machine_assign[job_id, self.current_op_idx[job_id]] == -1:
             self.completed_jobs[job_id] = True
 
-        reward = self._compute_reward() + step_penalty
         done = np.all(self.completed_jobs)
+
+        # --- 新版奖励计算 (目标函数 3.1, 3.2, 3.3) ---
+        # Z1: Wi * (x_D - x_O) 化简到单步就是权重 * 该步总消耗时间
+        # Z3: 在站等待时间 y_{i,q}
+        if not is_curr_maintenance:
+            z1_component = self.W[job_id] * (proc_time + min_stop + waiting_time)
+            z3_component = waiting_time
+            step_reward = - (z1_component + z3_component) / 100.0
+        else:
+            step_reward = 0  # 天窗不计入旅行时间优化目标
+
+        reward = step_reward + step_penalty
+
+        # 当所有列车调度完成时，结算 Z2 (列车运行图排布密度)
+        if done:
+            z2_penalty = 0.0
+            # 提取正常列车的实际始发时间并排序计算差值
+            reg_deps = [self.actual_departures[j] for j in range(self.n_jobs) if j not in self.maintenance_job_ids]
+            if len(reg_deps) > 1:
+                reg_deps = np.sort(reg_deps)
+                # Z2 目标: 最小化发车间隔绝对值之和
+                z2_penalty = np.sum(np.abs(np.diff(reg_deps)))
+
+            reward -= (z2_penalty / 100.0)
 
         return self.get_state(), reward, done, {
             'makespan': self.get_makespan(),

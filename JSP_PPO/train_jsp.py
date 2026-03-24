@@ -176,7 +176,7 @@ def train():
             print(f"Reached fixed maximum episodes ({n_episodes}). Stopping.")
             break
 
-        env = JSP_Env(n_jobs, n_machines, proc_times, machine_assign, device)
+        env = JSP_Env(n_jobs, n_machines, proc_times, machine_assign, device=device)
         state = env.reset()
         done = False
 
