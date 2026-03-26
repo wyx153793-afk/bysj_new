@@ -1,13 +1,12 @@
 """
 JSP Environment for Train Timetabling Problem
-(Modified to include Table 5-8 Safety Intervals and station minimum stops)
 """
 import torch
 import numpy as np
 
 class JSP_Env:
     def __init__(self, n_jobs, n_machines, processing_time_matrix,
-                 job_op_sequences, train_priorities=None, station_capacities=None,
+                 job_op_sequences, maintenance_job_ids=None, train_priorities=None, station_capacities=None,
                  planned_departures=None, min_stop_times=None, device='cuda'):
         self.n_jobs = n_jobs
         self.n_machines = n_machines
@@ -18,11 +17,17 @@ class JSP_Env:
 
         self.max_ops = processing_time_matrix.shape[1]
 
-        # 追踪与天窗基础参数
-        self.min_headway_maintenance = 120 # 天窗列车安全间隔 120min
-        self.maintenance_job_ids = [8, 9]  # 假设 T9, T10 为天窗列车
+        # --- 动态推算区间与车站数量 ---
+        self.n_sections = self.n_machines // 2
+        self.n_stations = self.n_sections + 1
 
-        # --- 引入表 5-8 车站安全间隔时间约束 (单位: min), 依据 300km/h 列车标准 ---
+        # 追踪与天窗基础参数
+        self.min_headway_maintenance = 120  # 天窗列车安全间隔 120min
+
+        # 而是使用外部传入的列表。如果没有传，则默认为空列表 []
+        self.maintenance_job_ids = maintenance_job_ids if maintenance_job_ids is not None else []
+
+        # 车站安全间隔时间约束 (单位: min)
         self.interval_DD = 240 / 60.0  # 到到 4.0 min
         self.interval_DT = 180 / 60.0  # 到通 3.0 min
         self.interval_FF = 240 / 60.0  # 发发 4.0 min
@@ -31,25 +36,26 @@ class JSP_Env:
         self.interval_TF = 90 / 60.0   # 通发 1.5 min
         self.interval_TD = 240 / 60.0  # 通到 4.0 min
 
-        # 机器ID对应的物理起止车站映射 (0:A, 1:B, 2:C, 3:D, 4:E)
-        self.machine_to_stations = {
-            0: (0, 1), 1: (1, 2), 2: (2, 3), 3: (3, 4),
-            4: (4, 3), 5: (3, 2), 6: (2, 1), 7: (1, 0)
-        }
+        # --- 动态生成机器ID对应的物理起止车站映射 ---
+        self.machine_to_stations = {}
+        for m in range(self.n_sections):
+            # 下行机器映射 (如 0 对应车站 0->1)
+            self.machine_to_stations[m] = (m, m + 1)
+            # 上行机器映射 (基于对称性，如 44台机器时，43 对应车站 1->0)
+            opp_m = self.n_machines - 1 - m
+            self.machine_to_stations[opp_m] = (m + 1, m)
 
-        # --- 论文中的参数与约束设定 ---
-        # 1. 列车等级权重 Wi (用于 Z1 目标函数)
+        # 1. 列车等级权重 Wi
         self.W = train_priorities if train_priorities is not None else np.ones(n_jobs)
 
-        # 2. 车站到发线容量 DF_q (用于到发线约束)
-        self.station_capacities = station_capacities if station_capacities is not None else {i: 2 for i in range(5)}
+        # 2. 动态生成车站到发线容量 (默认为每个车站2条到发线)
+        self.station_capacities = station_capacities if station_capacities is not None else {i: 2 for i in range(self.n_stations)}
 
         # 3. 计划始发时间
         self.planned_departures = planned_departures
 
-        # 4. 列车在车站的最短停站/技术作业时间 S_{i,q} (即高铁在车站的作业时分)
-        # 格式: [n_jobs, n_stations]
-        self.min_stop_times = min_stop_times if min_stop_times is not None else np.zeros((n_jobs, 5))
+        # 4. 动态生成最短停站时间矩阵
+        self.min_stop_times = min_stop_times if min_stop_times is not None else np.zeros((n_jobs, self.n_stations))
 
         self.reset()
 
@@ -64,18 +70,15 @@ class JSP_Env:
         self.completed_jobs = np.zeros(self.n_jobs, dtype=bool)
         self.schedule = {}
 
-        # 记录实际始发时间，用于计算 Z2 (发车密度)
         self.actual_departures = np.zeros(self.n_jobs)
 
-        self.station_records = {i: [] for i in range(5)}
-        self.section_records = {i: [] for i in range(8)}
+        # 动态适配字典长度
+        self.station_records = {i: [] for i in range(self.n_stations)}
+        self.section_records = {i: [] for i in range(self.n_machines)}
 
         return self.get_state()
 
     def check_capacity_violation(self, st, new_start, new_end):
-        """
-        判断车站 st 是否超过到发线容量 DF_q
-        """
         events = []
         for s, e in self.station_records[st]:
             if e > s:
@@ -145,43 +148,37 @@ class JSP_Env:
         machine_id = self.op_machine_assign[job_id, op_idx]
         proc_time = self.processing_time[job_id, op_idx]
 
-        opp_machine_id = 7 - machine_id
+        # 动态计算对向机器ID (原硬编码为 7 - machine_id)
+        opp_machine_id = self.n_machines - 1 - machine_id
         is_curr_maintenance = (job_id in self.maintenance_job_ids)
 
         ready_t = self.job_ready_time[job_id]
         start_st, end_st = self.machine_to_stations[machine_id]
 
-        # 叠加在车站的技术作业时间/停站时间 S_{i,q}
         min_stop = self.min_stop_times[job_id, start_st] if op_idx > 0 else 0
         start_time = ready_t + min_stop
 
-        # 追踪与越行逻辑：引入表 5-8 的 300km/h 安全间隔
         last_j = self.machine_last_job[machine_id]
         if last_j != -1:
             last_enter = self.machine_last_enter_time[machine_id]
             last_leave = self.machine_last_leave_time[machine_id]
 
-            # 天窗等特殊处理
             if last_j in self.maintenance_job_ids or is_curr_maintenance:
                 start_time = max(start_time, last_leave + self.min_headway_maintenance)
             else:
                 dir_curr = job_id % 2
                 dir_last = last_j % 2
                 if dir_curr == dir_last:
-                    # 同向: 取涉及同向行车的约束最大值(发发、发通、通通、通发)保障绝对安全
                     hw = max(self.interval_FF, self.interval_FT, self.interval_TF, self.interval_TT)
                 else:
-                    # 异向: 取涉及异向行车的约束最大值(到到、到通、通到)
                     hw = max(self.interval_DD, self.interval_DT, self.interval_TD)
                 start_time = max(start_time, last_enter + hw)
 
-        # 天窗互斥约束
         if is_curr_maintenance:
             last_j_opp = self.machine_last_job[opp_machine_id]
             if last_j_opp != -1:
                 start_time = max(start_time, self.machine_last_leave_time[opp_machine_id] + self.min_headway_maintenance)
 
-        # 冲突检测循环
         conflict = True
         while conflict:
             conflict = False
@@ -224,17 +221,14 @@ class JSP_Env:
 
         end_time = start_time + proc_time
 
-        # 记录避让等待时间 y_{i,q}
         waiting_time = max(0, start_time - ready_t - min_stop)
         step_penalty = 0.0
 
-        # --- 到发线约束判定 ---
         if start_time > ready_t:
             if self.check_capacity_violation(start_st, ready_t, start_time):
-                step_penalty -= 500.0  # 到发线超限，施加严重惩罚
+                step_penalty -= 500.0
             self.station_records[start_st].append((ready_t, start_time))
 
-        # 记录正常列车的实际始发时间 (用于计算Z2的均匀发车密度目标)
         if op_idx == 0 and not is_curr_maintenance:
             self.actual_departures[job_id] = start_time
 
@@ -245,7 +239,6 @@ class JSP_Env:
 
         self.schedule[(job_id, op_idx)] = (machine_id, start_time, end_time)
 
-        # 状态更新
         self.machine_last_job[machine_id] = job_id
         self.machine_last_leave_time[machine_id] = end_time
         self.machine_last_enter_time[machine_id] = start_time
@@ -269,7 +262,6 @@ class JSP_Env:
 
         done = np.all(self.completed_jobs)
 
-        # --- 混合奖励计算 ---
         if not is_curr_maintenance:
             z1_component = self.W[job_id] * (proc_time + min_stop + waiting_time)
             z3_component = waiting_time
