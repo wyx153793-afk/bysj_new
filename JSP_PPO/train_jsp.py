@@ -13,7 +13,7 @@ from PPO_JSP import PPO_JSP
 import matplotlib.pyplot as plt
 from vis_utils import plot_train_graph, plot_gantt_chart, save_schedule_to_csv
 
-def get_excel_data(excel_path='data/data1.xlsx'):
+def get_excel_data(excel_path='data/data2.xlsx'):
     """从 Excel 读取高铁调度基础数据"""
     if not os.path.exists(excel_path):
         raise FileNotFoundError(f"找不到数据文件：{excel_path}。请确保存在 data 文件夹且文件名为 data*.xlsx")
@@ -163,7 +163,7 @@ def train():
     # 调用修改后的 get_excel_data 函数
     try:
         proc_times, machine_assign, n_jobs, n_machines, max_ops, maintenance_job_ids = get_excel_data(
-            'data/train_data.xlsx')
+            'data/data2.xlsx')
         print(f"成功加载 Excel 数据！总任务数: {n_jobs}, 机器数: {n_machines}")
         print(f"识别到天窗列车 ID: {maintenance_job_ids}")  # 打印出来确认一下
     except Exception as e:
