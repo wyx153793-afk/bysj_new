@@ -21,8 +21,8 @@ class JSP_Env:
         self.n_sections = self.n_machines // 2
         self.n_stations = self.n_sections + 1
 
-        # 追踪与天窗基础参数
-        self.min_headway_maintenance = 120  # 天窗列车安全间隔 120min
+        # 【修改点】：追踪与天窗基础参数，根据铁路行车组织规则，V型天窗前后列车安全间隔设置为 15 分钟
+        self.min_headway_maintenance = 15
 
         # 而是使用外部传入的列表。如果没有传，则默认为空列表 []
         self.maintenance_job_ids = maintenance_job_ids if maintenance_job_ids is not None else []
@@ -74,8 +74,14 @@ class JSP_Env:
         self.job_ready_time = np.zeros(self.n_jobs)
         self.completed_ops = np.zeros((self.n_jobs, self.max_ops), dtype=bool)
         self.completed_jobs = np.zeros(self.n_jobs, dtype=bool)
-        self.schedule = {}
 
+        # ======== 【新增防御 1：初始化时剔除无动作的无效列车】 ========
+        for j in range(self.n_jobs):
+            if self.max_ops == 0 or self.op_machine_assign[j, 0] == -1:
+                self.completed_jobs[j] = True
+        # ==========================================================
+
+        self.schedule = {}
         self.actual_departures = np.zeros(self.n_jobs)
 
         # 动态适配字典长度
@@ -150,8 +156,25 @@ class JSP_Env:
         return max(regular_jobs_ready_time)
 
     def step(self, job_id):
+        job_id = int(job_id)  # 确保传入的是整数索引
+
+        # ======== 【新增防御 2：严禁网络选择已完成的列车】 ========
+        if self.completed_jobs[job_id]:
+            # 如果网络瞎选，给一个巨大的惩罚，并强制结束或返回原状态
+            done = np.all(self.completed_jobs)
+            return self.get_state(), -10.0, done, {'makespan': self.get_makespan(), 'scheduled': None}
+        # ==========================================================
+
         op_idx = self.current_op_idx[job_id]
         machine_id = self.op_machine_assign[job_id, op_idx]
+
+        # ======== 【新增防御 3：最后一道防线，兜底拦截 -1】 ========
+        if machine_id == -1:
+            self.completed_jobs[job_id] = True
+            done = np.all(self.completed_jobs)
+            return self.get_state(), -10.0, done, {'makespan': self.get_makespan(), 'scheduled': None}
+        # ==========================================================
+
         proc_time = self.processing_time[job_id, op_idx]
 
         # 动态计算对向机器ID
@@ -324,5 +347,5 @@ class JSP_Env:
 
         return self.get_state(), reward, done, {
             'makespan': self.get_makespan(),
-            'scheduled': (job_id, op_idx, machine_id, start_time, end_time)
+            'scheduled': (job_id, op_idx, machine_id, start_time, end_time) if not done else None
         }

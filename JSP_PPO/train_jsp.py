@@ -1,6 +1,3 @@
-"""
-JSP 训练脚本（单动作版本）
-"""
 import torch
 import numpy as np
 import os
@@ -13,39 +10,57 @@ from PPO_JSP import PPO_JSP
 import matplotlib.pyplot as plt
 from vis_utils import plot_train_graph, plot_gantt_chart, save_schedule_to_csv
 
-def get_excel_data(excel_path='data/data2.xlsx'):
+
+def get_excel_data(excel_path='data/data4.xlsx'):
     """从 Excel 读取高铁调度基础数据"""
     if not os.path.exists(excel_path):
         raise FileNotFoundError(f"找不到数据文件：{excel_path}。请确保存在 data 文件夹且文件名为 data*.xlsx")
 
     # 1. 读取全局参数 (Sheet1)
-    df_global = pd.read_excel(excel_path, sheet_name='Sheet1').set_index('param_name')
-    normal_train_speed = float(df_global.loc['normal_train_speed', 'param_value'])
+    df_global = pd.read_excel(excel_path, sheet_name='Sheet1')
+    # 【新增代码】：强制清除 param_name 这一列中所有字符串前后的隐藏空格
+    df_global['param_name'] = df_global['param_name'].astype(str).str.strip()
+    df_global = df_global.set_index('param_name')
+    # 获取不同类型列车的速度
+    speeds = {
+        'D': float(df_global.loc['speed_D', 'param_value']),
+        'C': float(df_global.loc['speed_C', 'param_value']),
+        'Z': float(df_global.loc['speed_Z', 'param_value']),
+        'T': float(df_global.loc['speed_T', 'param_value']),
+        'K': float(df_global.loc['speed_K', 'param_value']),
+        'Normal': float(df_global.loc['speed_Normal', 'param_value']),
+        'Freight': float(df_global.loc['speed_Freight', 'param_value'])
+    }
     skylight_total_time = float(df_global.loc['skylight_total_time', 'param_value'])
 
-    # 2. 读取区间信息 (Sheet2)，建立 机器ID -> 行驶时间 的映射
+    # 2. 读取区间信息 (Sheet2)
     df_sections = pd.read_excel(excel_path, sheet_name='Sheet2')
     total_dist = df_sections['distance'].sum()
 
-    machine_time_map = {}
+    # 建立 机器ID -> 行驶时间 的映射
+    machine_time_map = {t: {} for t in speeds.keys()}
     machine_skylight_time_map = {}
 
     for _, row in df_sections.iterrows():
         dist = row['distance']
-        # 普通列车时间
-        normal_time = int(dist / normal_train_speed)
         # 天窗时间 (按距离比例分配)
         skylight_time = int((dist / total_dist) * skylight_total_time)
 
-        # 下行映射
-        machine_time_map[row['down_machine']] = normal_time
-        machine_skylight_time_map[row['down_machine']] = skylight_time
-        # 上行映射
-        machine_time_map[row['up_machine']] = normal_time
-        machine_skylight_time_map[row['up_machine']] = skylight_time
+        down_m = row['down_machine']
+        up_m = row['up_machine']
+
+        machine_skylight_time_map[down_m] = skylight_time
+        machine_skylight_time_map[up_m] = skylight_time
+
+        # 计算各类型列车的时间
+        for t_type, speed in speeds.items():
+            # 【修改】：因为速度本身就是 km/min，除完直接是分钟！千万不要乘 60 了
+            # 保留 max(1, ...) 是为了防止距离太短(如小于速度值)时 int() 取整变成 0
+            time_val = max(1, int(dist / speed))
+            machine_time_map[t_type][down_m] = time_val
+            machine_time_map[t_type][up_m] = time_val
 
     # 3. 读取列车任务信息 (Sheet3)
-    # 兼容可能存在的不同 Sheet 命名习惯
     try:
         df_trains = pd.read_excel(excel_path, sheet_name='Sheet3')
     except ValueError:
@@ -56,24 +71,15 @@ def get_excel_data(excel_path='data/data2.xlsx'):
 
     n_jobs = len(df_trains)
 
-    # 序列解析函数，增强容错能力
     def parse_sequence(seq_val):
-        seq_str = str(seq_val)
-        # 替换中文逗号为英文逗号
-        seq_str = seq_str.replace('，', ',')
-        # 剔除所有空格
-        seq_str = seq_str.replace(' ', '')
-
-        # 拦截被 Excel 错误转成日期格式的数据 (如 2026-04-05)
+        seq_str = str(seq_val).replace('，', ',').replace(' ', '')
         if '-' in seq_str or ':' in seq_str:
-            raise ValueError(f"数据读取错误：识别到类似日期的格式 '{seq_str}'。请在 Excel 中将该列设置为'文本'格式，或输入时以单引号开头 (如 '4,5)。")
-
+            raise ValueError(f"数据读取错误：识别到类似日期的格式 '{seq_str}'。")
         return [int(m) for m in seq_str.split(',')]
 
     all_seqs = df_trains['machine_seq'].apply(parse_sequence)
     max_ops = all_seqs.apply(len).max()
 
-    # 自动推算机器总数 (以出现的最大的机器ID+1为准，保证索引不越界)
     all_machines = set()
     for seq in all_seqs:
         all_machines.update(seq)
@@ -82,31 +88,73 @@ def get_excel_data(excel_path='data/data2.xlsx'):
     # 4. 初始化输出矩阵与天窗列表
     processing_time = np.zeros((n_jobs, max_ops), dtype=int)
     op_machine_assign = -np.ones((n_jobs, max_ops), dtype=int)
-    maintenance_job_ids = []  # 【新增】动态收集天窗任务的 ID
+    maintenance_job_ids = []
+
+    def get_train_type(train_name):
+        train_name = str(train_name).strip()
+        if train_name == 'TC0': return 'Skylight'
+        if re.match(r'^D\d{3}$', train_name): return 'D'
+        if re.match(r'^C\d{3}$', train_name): return 'C'
+        if re.match(r'^Z\d{3,4}$', train_name): return 'Z'
+        if re.match(r'^T\d{3,4}$', train_name): return 'T'
+        if re.match(r'^K\d{4,5}$', train_name): return 'K'
+        if re.match(r'^\d{1,4}$', train_name): return 'Normal'
+        if re.match(r'^\d{5}$', train_name) or re.match(r'^X\d{4}$', train_name): return 'Freight'
+        return 'Normal'  # 默认降级为普通列车
 
     # 5. 填充矩阵数据并增加安全校验
     for idx, row in df_trains.iterrows():
         job_id = int(row['job_id'])
-        is_skylight = (row['type'] == 'Skylight')
+        train_name = row['train_name']
 
-        # 【新增】如果是天窗任务，将 job_id 加入列表
+        # 判断类型
+        t_type = get_train_type(train_name)
+        is_skylight = (t_type == 'Skylight')
+
         if is_skylight:
             maintenance_job_ids.append(job_id)
 
         seq = all_seqs.iloc[idx]
 
         for op_idx, m_id in enumerate(seq):
-            if m_id not in machine_time_map:
-                raise ValueError(f"配置错误：车次 {row['train_name']} 的机器编号 {m_id} 在区间配置(Sheet2)中不存在！")
-
             op_machine_assign[job_id, op_idx] = m_id
             if is_skylight:
                 processing_time[job_id, op_idx] = machine_skylight_time_map[m_id]
             else:
-                processing_time[job_id, op_idx] = machine_time_map[m_id]
+                processing_time[job_id, op_idx] = machine_time_map[t_type][m_id]
 
-    # 【修改】返回参数中加上 maintenance_job_ids
-    return processing_time, op_machine_assign, n_jobs, n_machines, max_ops, maintenance_job_ids
+            # ================= 新增：6. 读取停站时间 (Sheet4) =================
+            # 根据机器数推算车站数
+        n_stations = (n_machines // 2) + 1
+        min_stop_times = np.zeros((n_jobs, n_stations), dtype=int)
+
+        # 建立 train_name 到 job_id 的映射，方便后面填入对应位置
+        train_to_job = {}
+        for idx, row in df_trains.iterrows():
+            t_name = str(row['train_name']).strip()
+            train_to_job[t_name] = int(row['job_id'])
+
+        try:
+            df_stops = pd.read_excel(excel_path, sheet_name='Sheet4')
+            # 获取所有以 station 开头的列名（忽略大小写）
+            station_cols = [c for c in df_stops.columns if str(c).lower().startswith('station')]
+
+            for idx, row in df_stops.iterrows():
+                t_name = str(row['train_name']).strip()
+                if t_name in train_to_job:
+                    j_id = train_to_job[t_name]
+                    # 按顺序遍历车站列，填入矩阵
+                    for i, col in enumerate(station_cols):
+                        if i < n_stations:  # 防止越界
+                            val = row[col]
+                            # 遇到空值(NaN)填0，否则转为整数
+                            min_stop_times[j_id, i] = 0 if pd.isna(val) else int(val)
+        except Exception as e:
+            print(f"⚠️ 警告：读取 Sheet4 停站时间失败 ({e})，将默认所有停站时间为 0。")
+        # ==================================================================
+
+        # 【修改】：返回的最后加上 min_stop_times
+        return processing_time, op_machine_assign, n_jobs, n_machines, max_ops, maintenance_job_ids, min_stop_times
 
 def find_best_historical_model(directories):
     """
@@ -141,7 +189,7 @@ def train():
     patience = 50              # 无限模式下：连续多少轮没破记录则早停
 
     # 自动加载历史最优模型开关
-    LOAD_PREVIOUS_BEST = True
+    LOAD_PREVIOUS_BEST = False
     # ==========================================
 
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -162,12 +210,15 @@ def train():
 
     # 调用修改后的 get_excel_data 函数
     try:
-        proc_times, machine_assign, n_jobs, n_machines, max_ops, maintenance_job_ids = get_excel_data(
-            'data/data2.xlsx')
+        # 注意：这里等号左边现在是 7 个变量了。
+        proc_times, machine_assign, n_jobs, n_machines, max_ops, maintenance_job_ids, min_stop_times = get_excel_data(
+            'data/data4.xlsx')
+
         print(f"成功加载 Excel 数据！总任务数: {n_jobs}, 机器数: {n_machines}")
-        print(f"识别到天窗列车 ID: {maintenance_job_ids}")  # 打印出来确认一下
+        print(f"识别到天窗列车 ID: {maintenance_job_ids}")
     except Exception as e:
-        print(f"数据加载失败: {e}")
+        # 💡 调试小贴士：如果以后遇到报错不知道在哪，可以把下面这行改成 raise e，这样就会打印详细报错行号
+        raise e
         return
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -203,9 +254,11 @@ def train():
             print(f"Reached fixed maximum episodes ({n_episodes}). Stopping.")
             break
 
-        # 【修改】将 maintenance_job_ids 传给环境
+        # 【核心修改】将动态读取的 min_stop_times 传给环境
         env = JSP_Env(n_jobs, n_machines, proc_times, machine_assign,
-                      maintenance_job_ids=maintenance_job_ids, device=device)
+                      maintenance_job_ids=maintenance_job_ids,
+                      min_stop_times=min_stop_times,
+                      device=device)
         state = env.reset()
         done = False
 
