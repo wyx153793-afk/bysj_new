@@ -19,10 +19,13 @@ def get_station_name(i):
         return chr(65 + i)
     return f'S{i}'
 
-def plot_train_graph(schedule, n_machines, n_jobs, save_path):
+def plot_train_graph(schedule, n_machines, n_jobs, save_path, train_names_dict=None, maintenance_job_ids=None):
     """
     绘制高铁运行图 (Time-Distance Graph)
     """
+    if train_names_dict is None: train_names_dict = {}
+    if maintenance_job_ids is None: maintenance_job_ids = []
+
     plt.figure(figsize=(15, 8))
 
     n_sections = n_machines // 2
@@ -62,11 +65,11 @@ def plot_train_graph(schedule, n_machines, n_jobs, save_path):
             times.append(end)
             positions.append(p_end)
 
-        # 绘制折线
-        actual_train_name = f'T{job_id + 1}'  # 车次名从 T1 开始
+        # 【修改】：动态获取真实车次名称
+        actual_train_name = train_names_dict.get(job_id, f'T{job_id + 1}')
 
-        # 天窗列车样式 (保留目标代码中对特定job_id的特判，如8,9)
-        if job_id in [8, 9]:
+        # 【修改】：天窗列车样式，使用动态传入的天窗ID列表
+        if job_id in maintenance_job_ids:
             for i in range(0, len(times), 2):
                 t_start = times[i]
                 t_end = times[i + 1]
@@ -104,12 +107,12 @@ def plot_train_graph(schedule, n_machines, n_jobs, save_path):
     plt.close()
 
 
-def plot_gantt_chart(schedule, n_machines, n_jobs, save_path):
+def plot_gantt_chart(schedule, n_machines, n_jobs, save_path, train_names_dict=None):
     """
     绘制资源占用甘特图
-    Y轴：机器（车站/区间）
-    X轴：时间
     """
+    if train_names_dict is None: train_names_dict = {}
+
     plt.figure(figsize=(15, 8))
     colors = plt.cm.tab20(np.linspace(0, 1, max(20, n_jobs)))
 
@@ -117,7 +120,7 @@ def plot_gantt_chart(schedule, n_machines, n_jobs, save_path):
     n_stations = n_sections + 1
     station_names = [get_station_name(i) for i in range(n_stations)]
 
-    # 动态显式标明各个机器代表的区间，增强直观性
+    # 动态显式标明各个机器代表的区间
     machine_names = {}
     for m in range(n_sections):
         machine_names[m] = f'M{m} ({station_names[m]}->{station_names[m+1]})'
@@ -129,16 +132,18 @@ def plot_gantt_chart(schedule, n_machines, n_jobs, save_path):
         plt.barh(machine_id, duration, left=start, height=0.6,
                  color=colors[job_id % len(colors)], edgecolor='black', alpha=0.8)
 
+        # 【修改】：动态获取真实车次名称
+        actual_train_name = train_names_dict.get(job_id, f'T{job_id + 1}')
+
         # 在条形图中间标注车次
         if duration > 2:
-            plt.text(start + duration / 2, machine_id, f'T{job_id + 1}',
+            plt.text(start + duration / 2, machine_id, actual_train_name,
                      ha='center', va='center', color='white', fontsize=8)
 
     plt.xlabel('Time (minutes)', fontsize=14)
     plt.ylabel('Resource (Station / Section)', fontsize=14)
     plt.title('Resource Occupation Gantt Chart', fontsize=16)
 
-    # 将Y轴标签替换为带方向的机器名字
     plt.yticks(range(n_machines), [machine_names.get(i, f'M{i}') for i in range(n_machines)])
     plt.grid(True, axis='x', linestyle='--', alpha=0.7)
 
@@ -147,15 +152,16 @@ def plot_gantt_chart(schedule, n_machines, n_jobs, save_path):
     plt.close()
 
 
-def save_schedule_to_csv(schedule, save_path):
+def save_schedule_to_csv(schedule, save_path, train_names_dict=None):
     """
-    将调度结果保存为CSV
+    将调度结果保存为CSV，并增加HH:MM的时间格式
     """
+    if train_names_dict is None: train_names_dict = {}
+
     if not schedule:
         pd.DataFrame().to_csv(save_path, index=False)
         return
 
-    # 推算并动态生成机器名称 (以适配不同数量的区间)
     n_machines = max([m_id for (_, _), (m_id, _, _) in schedule.items()]) + 1
     n_sections = n_machines // 2
     n_stations = n_sections + 1
@@ -167,23 +173,33 @@ def save_schedule_to_csv(schedule, save_path):
         opp_m = n_machines - 1 - m
         machine_names[opp_m] = f'M{opp_m} ({station_names[m+1]}->{station_names[m]})'
 
+    # 【新增】：分钟转 小时:分钟 格式工具函数
+    def format_time(mins):
+        h = int(mins) // 60
+        m = int(mins) % 60
+        return f"{h}:{m:02d}"
+
     data = []
     for (job_id, op_idx), (machine_id, start, end) in schedule.items():
+        actual_train_name = train_names_dict.get(job_id, f'T{job_id + 1}')
         data.append({
-            'Train ID': f'T{job_id + 1}',
+            'Job ID': job_id,  # 隐藏列，用于最后正确排序
+            'Train ID': actual_train_name,
             'Operation ID': op_idx,
             'Station/Section (Machine)': machine_names.get(machine_id, f'M{machine_id}'),
-            'Start Time': start,
-            'End Time': end,
-            'Duration': end - start
+            'Start Time (min)': start,
+            'End Time (min)': end,
+            'Start Time (HH:MM)': format_time(start), # 【新增】
+            'End Time (HH:MM)': format_time(end),     # 【新增】
+            'Duration (min)': end - start
         })
 
     # 创建DataFrame
     df = pd.DataFrame(data)
 
-    # 按车次和开始时间排序 (需要转换为整数排序保证 T10 在 T2 后面)
-    df['TrainNum'] = df['Train ID'].apply(lambda x: int(x[1:]))
-    df = df.sort_values(by=['TrainNum', 'Start Time']).drop('TrainNum', axis=1)
+    # 【修改】：由于真实车次名不一定是单纯的T1,T2，因此不能再强转字符串切片排序。
+    # 改为按底层的 Job ID 结合 Start Time 排序，排好后再把 Job ID 删掉。
+    df = df.sort_values(by=['Job ID', 'Start Time (min)']).drop('Job ID', axis=1)
 
     # 保存为CSV
     df.to_csv(save_path, index=False, encoding='utf_8_sig')

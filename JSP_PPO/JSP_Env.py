@@ -21,10 +21,9 @@ class JSP_Env:
         self.n_sections = self.n_machines // 2
         self.n_stations = self.n_sections + 1
 
-        # 【修改点】：追踪与天窗基础参数，根据铁路行车组织规则，V型天窗前后列车安全间隔设置为 15 分钟
+        # 追踪与天窗基础参数，根据铁路行车组织规则，V型天窗前后列车安全间隔设置为 15 分钟
         self.min_headway_maintenance = 15
 
-        # 而是使用外部传入的列表。如果没有传，则默认为空列表 []
         self.maintenance_job_ids = maintenance_job_ids if maintenance_job_ids is not None else []
 
         # 车站安全间隔时间约束 (单位: min)
@@ -36,7 +35,7 @@ class JSP_Env:
         self.interval_TF = 90 / 60.0   # 通发 1.5 min
         self.interval_TD = 240 / 60.0  # 通到 4.0 min
 
-        # 【新增】：建立状态组合与安全间隔的映射字典，用于动态查询
+        # 建立状态组合与安全间隔的映射字典
         self.intervals = {
             'FF': self.interval_FF, 'FT': self.interval_FT, 'TF': self.interval_TF, 'TT': self.interval_TT,
             'DD': self.interval_DD, 'DT': self.interval_DT, 'TD': self.interval_TD
@@ -45,22 +44,20 @@ class JSP_Env:
         # --- 动态生成机器ID对应的物理起止车站映射 ---
         self.machine_to_stations = {}
         for m in range(self.n_sections):
-            # 下行机器映射 (如 0 对应车站 0->1)
             self.machine_to_stations[m] = (m, m + 1)
-            # 上行机器映射 (基于对称性，如 44台机器时，43 对应车站 1->0)
             opp_m = self.n_machines - 1 - m
             self.machine_to_stations[opp_m] = (m + 1, m)
 
-        # 1. 列车等级权重 Wi
+        # 列车等级权重 Wi
         self.W = train_priorities if train_priorities is not None else np.ones(n_jobs)
 
-        # 2. 动态生成车站到发线容量 (默认为每个车站2条到发线)
+        # 动态生成车站到发线容量
         self.station_capacities = station_capacities if station_capacities is not None else {i: 2 for i in range(self.n_stations)}
 
-        # 3. 计划始发时间
+        # 计划始发时间
         self.planned_departures = planned_departures
 
-        # 4. 动态生成最短停站时间矩阵
+        # 动态生成最短停站时间矩阵
         self.min_stop_times = min_stop_times if min_stop_times is not None else np.zeros((n_jobs, self.n_stations))
 
         self.reset()
@@ -75,16 +72,13 @@ class JSP_Env:
         self.completed_ops = np.zeros((self.n_jobs, self.max_ops), dtype=bool)
         self.completed_jobs = np.zeros(self.n_jobs, dtype=bool)
 
-        # ======== 【新增防御 1：初始化时剔除无动作的无效列车】 ========
         for j in range(self.n_jobs):
             if self.max_ops == 0 or self.op_machine_assign[j, 0] == -1:
                 self.completed_jobs[j] = True
-        # ==========================================================
 
         self.schedule = {}
         self.actual_departures = np.zeros(self.n_jobs)
 
-        # 动态适配字典长度
         self.station_records = {i: [] for i in range(self.n_stations)}
         self.section_records = {i: [] for i in range(self.n_machines)}
 
@@ -156,28 +150,21 @@ class JSP_Env:
         return max(regular_jobs_ready_time)
 
     def step(self, job_id):
-        job_id = int(job_id)  # 确保传入的是整数索引
+        job_id = int(job_id)
 
-        # ======== 【新增防御 2：严禁网络选择已完成的列车】 ========
         if self.completed_jobs[job_id]:
-            # 如果网络瞎选，给一个巨大的惩罚，并强制结束或返回原状态
             done = np.all(self.completed_jobs)
             return self.get_state(), -10.0, done, {'makespan': self.get_makespan(), 'scheduled': None}
-        # ==========================================================
 
         op_idx = self.current_op_idx[job_id]
         machine_id = self.op_machine_assign[job_id, op_idx]
 
-        # ======== 【新增防御 3：最后一道防线，兜底拦截 -1】 ========
         if machine_id == -1:
             self.completed_jobs[job_id] = True
             done = np.all(self.completed_jobs)
             return self.get_state(), -10.0, done, {'makespan': self.get_makespan(), 'scheduled': None}
-        # ==========================================================
 
         proc_time = self.processing_time[job_id, op_idx]
-
-        # 动态计算对向机器ID
         opp_machine_id = self.n_machines - 1 - machine_id
         is_curr_maintenance = (job_id in self.maintenance_job_ids)
 
@@ -187,7 +174,7 @@ class JSP_Env:
         min_stop = self.min_stop_times[job_id, start_st] if op_idx > 0 else 0
         start_time = ready_t + min_stop
 
-        # 初始启发式快速推进（保留以加速寻优）
+        # 启发式快速推进
         last_j = self.machine_last_job[machine_id]
         if last_j != -1:
             last_enter = self.machine_last_enter_time[machine_id]
@@ -213,15 +200,10 @@ class JSP_Env:
         while conflict:
             conflict = False
 
-            # 【核心修改】：精准识别当前时刻下的发、到、通状态
-            # 出发站(s)：若是首站、或有最短停站时间要求、或实际发生等待（start_time > ready_t），均为"发(F)"，否则为"通(T)"
             curr_event_start = 'F' if (op_idx == 0 or min_stop > 0 or start_time > ready_t) else 'T'
-            # 到达站(s+1)：若是终到站、或下一站有最短停站时间要求，均为"到(D)"，否则为"通(T)"
             curr_event_end = 'D' if (op_idx == self.max_ops - 1 or self.min_stop_times[job_id, end_st] > 0) else 'T'
-
             end_time = start_time + proc_time
 
-            # 遍历区间内所有已安排列车，进行严格次序与安全间隔约束判定
             for s_prev, e_prev, j_prev, prev_event_start, prev_event_end in self.section_records[machine_id]:
                 is_j_maint = (j_prev in self.maintenance_job_ids)
                 if is_curr_maintenance or is_j_maint:
@@ -231,46 +213,33 @@ class JSP_Env:
                         conflict = True
                         break
                 else:
-                    # 【核心修改】：代入文献中的列车运行图定序优化数学不等式约束
                     if start_time >= s_prev:
-                        # 当前列车排在 j_prev 之后
-
-                        # 1. 出发安全间隔约束：d_j^s - d_i^s > HW_start
                         hw_start = self.intervals[prev_event_start + curr_event_start]
                         if start_time < s_prev + hw_start:
                             start_time = s_prev + hw_start
                             conflict = True
                             break
 
-                        # 2. 到达安全间隔约束：a_j^{s+1} - a_i^{s+1} > HW_end
                         hw_end = self.intervals[prev_event_end + curr_event_end]
                         if end_time < e_prev + hw_end:
-                            # 为保证到达间隔满足要求，逆推推迟发车时间
                             start_time = e_prev + hw_end - proc_time
                             conflict = True
                             break
                     else:
-                        # 当前列车试图排在 j_prev 之前
-
-                        # 1. 出发安全间隔约束：d_i^s - d_j^s > HW_start (此时j_prev成为后车)
                         hw_start = self.intervals[curr_event_start + prev_event_start]
                         if s_prev < start_time + hw_start:
-                            # 空间不足以插入，被迫延后到 j_prev 之后发车
                             start_time = s_prev + self.intervals[prev_event_start + curr_event_start]
                             conflict = True
                             break
 
-                        # 2. 到达安全间隔约束：a_i^{s+1} - a_j^{s+1} > HW_end
                         hw_end = self.intervals[curr_event_end + prev_event_end]
                         if e_prev < end_time + hw_end:
-                            # 区间不可越行约束，被迫延后到 j_prev 之后发车
                             start_time = s_prev + self.intervals[prev_event_start + curr_event_start]
                             conflict = True
                             break
 
             if conflict: continue
 
-            # 对向线路天窗冲突判断
             for s_prev, e_prev, j_prev, _, _ in self.section_records[opp_machine_id]:
                 is_j_maint = (j_prev in self.maintenance_job_ids)
                 if is_curr_maintenance or is_j_maint:
@@ -280,7 +249,6 @@ class JSP_Env:
                         conflict = True
                         break
 
-        # 确定下最终发车时间后，确立最终端点事件状态
         final_event_start = 'F' if (op_idx == 0 or min_stop > 0 or start_time > ready_t) else 'T'
         final_event_end = 'D' if (op_idx == self.max_ops - 1 or self.min_stop_times[job_id, end_st] > 0) else 'T'
         end_time = start_time + proc_time
@@ -295,8 +263,10 @@ class JSP_Env:
 
         if op_idx == 0 and not is_curr_maintenance:
             self.actual_departures[job_id] = start_time
+            # 强制当天发车约束
+            if start_time > 1440.0:
+                step_penalty -= (2000.0 + (start_time - 1440.0) * 10.0)
 
-        # 【核心修改】：section_records 新增记录当前作业的发、到、通状态元组 (s, e, j, event_s, event_e)
         self.section_records[machine_id].append((start_time, end_time, job_id, final_event_start, final_event_end))
 
         if is_curr_maintenance:
@@ -320,8 +290,11 @@ class JSP_Env:
 
         self.current_op_idx[job_id] += 1
 
+        # =========================================================================
+        # 【核心修改】：去掉了遇到 processing_time 为0就直接结束任务(completed_jobs = True) 的BUG。
+        # 使得同站（O和S）转换时能够用时0分钟且合法跨越。
+        # =========================================================================
         if self.current_op_idx[job_id] >= self.max_ops or \
-                self.processing_time[job_id, self.current_op_idx[job_id]] == 0 or \
                 self.op_machine_assign[job_id, self.current_op_idx[job_id]] == -1:
             self.completed_jobs[job_id] = True
 
