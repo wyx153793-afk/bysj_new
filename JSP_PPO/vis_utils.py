@@ -6,7 +6,6 @@ import pandas as pd
 import numpy as np
 import matplotlib as mpl
 
-# 尝试解决图表中文字体显示问题 (防止乱码)
 try:
     mpl.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial']
     mpl.rcParams['axes.unicode_minus'] = False
@@ -54,36 +53,67 @@ def plot_train_graph(schedule, n_machines, n_jobs, save_path, train_names_dict=N
         times = []
         positions = []
 
+        last_p_end = None # 记录上一次操作结束的位置
+
         for op, m, start, end in job_ops:
             if m not in machine_positions:
                 continue
             p_start, p_end = machine_positions[m]
-            # 记录起点时间和位置
-            times.append(start)
-            positions.append(p_start)
-            # 记录终点时间和位置
-            times.append(end)
-            positions.append(p_end)
 
-        # 【修改】：动态获取真实车次名称
+            # S站的索引为18，O站的索引为14
+            O_idx = 14
+            S_idx = 18
+
+            # 如果上一个操作结束点到当前起点的跳跃发生在S和O之间，插入 nan 断开连线
+            if last_p_end is not None:
+                is_SO_jump = (last_p_end == O_idx and p_start == S_idx) or (last_p_end == S_idx and p_start == O_idx)
+                if is_SO_jump:
+                    times.extend([np.nan, np.nan])
+                    positions.extend([np.nan, np.nan])
+
+            # 如果操作本身就在S和O之间，则隐藏这段运行线
+            is_SO_op = (p_start == O_idx and p_end == S_idx) or (p_start == S_idx and p_end == O_idx)
+            if is_SO_op:
+                times.extend([np.nan, np.nan])
+                positions.extend([np.nan, np.nan])
+            else:
+                # 记录起点时间和位置
+                times.append(start)
+                positions.append(p_start)
+                # 记录终点时间和位置
+                times.append(end)
+                positions.append(p_end)
+
+            last_p_end = p_end
+
+        # 动态获取真实车次名称
         actual_train_name = train_names_dict.get(job_id, f'T{job_id + 1}')
 
-        # 【修改】：天窗列车样式，使用动态传入的天窗ID列表
+        # 天窗列车样式，使用动态传入的天窗ID列表
         if job_id in maintenance_job_ids:
+            label_added = False
             for i in range(0, len(times), 2):
                 t_start = times[i]
                 t_end = times[i + 1]
                 p_start = positions[i]
                 p_end = positions[i + 1]
 
-                label_str = f'Skylight ({actual_train_name})' if i == 0 else ""
+                # 跳过被设置为 nan 的隐藏线段
+                if pd.isna(t_start) or pd.isna(t_end):
+                    continue
+
+                label_str = f'Skylight ({actual_train_name})' if not label_added else ""
                 plt.plot([t_start, t_end], [p_start, p_end], '-', color='gray', linewidth=10, alpha=0.3, label=label_str)
                 plt.plot([t_start, t_end], [p_start, p_end], '--', color='black', linewidth=1)
+                label_added = True
         else:
             # 普通列车
             plt.plot(times, positions, 'o-', label=actual_train_name, color=colors[job_id % len(colors)], linewidth=2, markersize=4)
             if times:
-                plt.text(times[0], positions[0], actual_train_name, verticalalignment='bottom', fontsize=9, fontweight='bold')
+                # 找到第一个非 nan 的坐标点来放置文本标签
+                first_valid_idx = next((i for i, t in enumerate(times) if not pd.isna(t)), -1)
+                if first_valid_idx != -1:
+                    plt.text(times[first_valid_idx], positions[first_valid_idx], actual_train_name, verticalalignment='bottom', fontsize=9, fontweight='bold')
 
     # X轴刻度：按小时划分，展示 0h, 1h...
     ticks = np.arange(0, 25 * 60, 60)
@@ -132,7 +162,7 @@ def plot_gantt_chart(schedule, n_machines, n_jobs, save_path, train_names_dict=N
         plt.barh(machine_id, duration, left=start, height=0.6,
                  color=colors[job_id % len(colors)], edgecolor='black', alpha=0.8)
 
-        # 【修改】：动态获取真实车次名称
+        # 动态获取真实车次名称
         actual_train_name = train_names_dict.get(job_id, f'T{job_id + 1}')
 
         # 在条形图中间标注车次
@@ -173,7 +203,7 @@ def save_schedule_to_csv(schedule, save_path, train_names_dict=None):
         opp_m = n_machines - 1 - m
         machine_names[opp_m] = f'M{opp_m} ({station_names[m+1]}->{station_names[m]})'
 
-    # 【新增】：分钟转 小时:分钟 格式工具函数
+    # 分钟转 小时:分钟 格式工具函数
     def format_time(mins):
         h = int(mins) // 60
         m = int(mins) % 60
@@ -189,15 +219,15 @@ def save_schedule_to_csv(schedule, save_path, train_names_dict=None):
             'Station/Section (Machine)': machine_names.get(machine_id, f'M{machine_id}'),
             'Start Time (min)': start,
             'End Time (min)': end,
-            'Start Time (HH:MM)': format_time(start), # 【新增】
-            'End Time (HH:MM)': format_time(end),     # 【新增】
+            'Start Time (HH:MM)': format_time(start),
+            'End Time (HH:MM)': format_time(end),
             'Duration (min)': end - start
         })
 
     # 创建DataFrame
     df = pd.DataFrame(data)
 
-    # 【修改】：由于真实车次名不一定是单纯的T1,T2，因此不能再强转字符串切片排序。
+    # 由于真实车次名不一定是单纯的T1,T2，因此不能再强转字符串切片排序。
     # 改为按底层的 Job ID 结合 Start Time 排序，排好后再把 Job ID 删掉。
     df = df.sort_values(by=['Job ID', 'Start Time (min)']).drop('Job ID', axis=1)
 

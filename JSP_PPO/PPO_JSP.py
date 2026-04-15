@@ -39,7 +39,8 @@ class Critic(nn.Module):
         return self.value_head(global_feat)
 
 class PPO_JSP:
-    def __init__(self, n_jobs, n_machines, lr=3e-4, gamma=0.99, lam=0.95, clip_epsilon=0.2, device='cuda'):
+    def __init__(self, n_jobs, n_machines, lr=3e-4, gamma=0.99, lam=0.95, clip_epsilon=0.1, device='cuda'):
+        # clip_epsilon从0.2改为0.1，更保守的更新
         self.device = device; self.gamma = gamma; self.lam = lam; self.clip_epsilon = clip_epsilon
         self.actor = Actor().to(device)
         self.critic = Critic(n_jobs, n_machines).to(device)
@@ -61,9 +62,19 @@ class PPO_JSP:
         advantages = []
         gae = 0
         for t in reversed(range(len(rewards))):
-            next_value = 0 if t == len(rewards) - 1 else values[t + 1]
-            delta = rewards[t] + self.gamma * next_value * (1 - dones[t]) - values[t]
-            gae = delta + self.gamma * self.lam * (1 - dones[t]) * gae
+            # 修复：区分episode结束和buffer结束
+            if dones[t]:
+                next_value = 0  # episode结束，无未来奖励
+            else:
+                next_value = values[t + 1] if t < len(values) - 1 else 0
+
+            delta = rewards[t] + self.gamma * next_value - values[t]
+            gae = delta + self.gamma * self.lam * gae
+
+            # episode结束时重置gae
+            if dones[t]:
+                gae = 0
+
             advantages.insert(0, gae)
         return torch.FloatTensor(advantages).to(self.device)
 
@@ -78,6 +89,9 @@ class PPO_JSP:
         with torch.no_grad(): values = torch.cat([self.critic(s) for s in states]).squeeze()
         advantages = self.compute_gae(rewards.cpu().numpy(), values.cpu().numpy(), dones.cpu().numpy())
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        # 计算returns用于critic训练
+        returns = advantages + values
+        returns = (returns - returns.mean()) / (returns.std() + 1e-8)  # 添加这行
 
         dataset_size = len(self.buffer)
         for epoch in range(n_epochs):
@@ -88,7 +102,7 @@ class PPO_JSP:
                 batch_states, batch_actions = [states[i] for i in batch_idx], actions[batch_idx]
                 batch_old_log_probs = old_log_probs[batch_idx]
                 batch_advantages = advantages[batch_idx]
-                batch_returns = advantages[batch_idx] + values[batch_idx]
+                batch_returns = returns[batch_idx]
 
                 new_log_probs = []
                 for s, a in zip(batch_states, batch_actions):
@@ -105,7 +119,7 @@ class PPO_JSP:
                 critic_loss = nn.MSELoss()(current_values, batch_returns)
                 entropy = -(new_log_probs * torch.exp(new_log_probs)).mean()
 
-                loss = actor_loss + 0.5 * critic_loss - 0.01 * entropy
+                loss = actor_loss + 0.5 * critic_loss - 0.05 * entropy  # entropy从0.01增加到0.05
                 self.optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)

@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 from vis_utils import plot_train_graph, plot_gantt_chart, save_schedule_to_csv
 
 
-def get_excel_data(excel_path='data/data4.xlsx'):
+def get_excel_data(excel_path='data/data5.xlsx'):
     """从 Excel 读取高铁调度基础数据"""
     if not os.path.exists(excel_path):
         raise FileNotFoundError(f"找不到数据文件：{excel_path}。请确保存在 data 文件夹且文件名为 data*.xlsx")
@@ -54,10 +54,7 @@ def get_excel_data(excel_path='data/data4.xlsx'):
         machine_skylight_time_map[up_m] = skylight_time
 
         for t_type, speed in speeds.items():
-            # =======================================================
-            # 【核心修改】：处理距离为0的虚拟区间（如O和S为同一站），
-            # 避免出现强制的1分钟空走，让耗时精准为0
-            # =======================================================
+
             if dist <= 0.0001:
                 time_val = 0
             else:
@@ -188,12 +185,16 @@ def find_best_historical_model(directories):
 
 
 def train():
-    USE_FIXED_EPISODES = False
-    n_episodes = 500
-    patience = 50
+    USE_FIXED_EPISODES = True
+    n_episodes = 300
     LOAD_PREVIOUS_BEST = False
 
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    window_size = 100
+    min_improvement = 30
+    patience = 200
+    best_sliding_avg = float('inf')
+    no_improve_count = 0
     results_dir = f'results/train_{timestamp}'
     dir_fixed = 'results/best_models_fixed'
     dir_infinite = 'results/best_models_infinite'
@@ -208,7 +209,7 @@ def train():
 
     try:
         proc_times, machine_assign, n_jobs, n_machines, max_ops, maintenance_job_ids, min_stop_times, train_priorities, train_names_dict = get_excel_data(
-            'data/data4.xlsx')
+            'data/data5.xlsx')
 
         print(f"成功加载 Excel 数据！总任务数: {n_jobs}, 机器数: {n_machines}")
         print(f"识别到天窗列车 ID: {maintenance_job_ids}")
@@ -217,7 +218,7 @@ def train():
         return
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    ppo = PPO_JSP(n_jobs, n_machines, device=device)
+    ppo = PPO_JSP(n_jobs, n_machines, lr=1e-4, device=device)
 
     if LOAD_PREVIOUS_BEST:
         best_hist_path, best_hist_mk = find_best_historical_model([dir_fixed, dir_infinite])
@@ -257,6 +258,24 @@ def train():
         last_env = env
         makespan = env.get_makespan()
         makespan_history.append(makespan)
+        # 每50轮评估一次滑动窗口均值
+        if episode > 0 and episode % 50 == 0 and len(makespan_history) >= window_size:
+            recent_avg = np.mean(makespan_history[-window_size:])
+
+            if recent_avg < best_sliding_avg - min_improvement:
+                best_sliding_avg = recent_avg
+                no_improve_count = 0
+                print(f"🟢 Episode {episode}: 滑动均值改进至 {recent_avg:.1f}")
+            else:
+                no_improve_count += 50
+                print(f"🟡 Episode {episode}: 滑动均值 {recent_avg:.1f}, 无改进: {no_improve_count}/{patience}")
+
+            # 智能早停
+            if no_improve_count >= patience:
+                print(f"🔴 早停: {patience}轮无显著改进")
+                print(f"   最优滑动均值: {best_sliding_avg:.1f}")
+                break
+
 
         if makespan < session_best_makespan:
             session_best_makespan = makespan
@@ -276,7 +295,8 @@ def train():
         else:
             episodes_without_improvement += 1
 
-        if episode % 10 == 0 and episode > 0:
+        # 积累足够样本就更新，更频繁
+        if len(ppo.buffer) >= 32:  # 或每轮都更新：if len(ppo.buffer) > 0:
             ppo.update()
 
         if episode % 50 == 0:
@@ -284,9 +304,7 @@ def train():
             print(
                 f"Episode {episode}, Current: {makespan}, Avg(50): {avg_makespan:.2f}, No Improve: {episodes_without_improvement}")
 
-        if not USE_FIXED_EPISODES and episodes_without_improvement >= patience:
-            print(f"🔴 No improvement for {patience} episodes. Early stopping.")
-            break
+
         episode += 1
 
     current_model_path = os.path.join(results_dir, 'policy_job_final.pth')

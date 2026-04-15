@@ -82,6 +82,13 @@ class JSP_Env:
         self.station_records = {i: [] for i in range(self.n_stations)}
         self.section_records = {i: [] for i in range(self.n_machines)}
 
+        # 添加episode累计变量
+        self.episode_z1 = 0.0
+        self.episode_z3 = 0.0
+
+        # 密集奖励：记录上一步的部分makespan
+        self.prev_partial_makespan = 0.0
+
         return self.get_state()
 
     def check_capacity_violation(self, st, new_start, new_end):
@@ -148,6 +155,21 @@ class JSP_Env:
         if not regular_jobs_ready_time:
             return 0
         return max(regular_jobs_ready_time)
+
+    def get_partial_makespan(self):
+        """计算当前部分调度的makespan（包括已完成和进行中的任务）"""
+        regular_times = []
+        for j in range(self.n_jobs):
+            if j not in self.maintenance_job_ids:
+                # 如果任务已完成，用完成时间；否则用当前已调度的时间
+                if self.completed_jobs[j]:
+                    regular_times.append(self.job_ready_time[j])
+                elif self.job_ready_time[j] > 0:  # 至少调度了一部分
+                    regular_times.append(self.job_ready_time[j])
+
+        if not regular_times:
+            return 0
+        return max(regular_times)
 
     def step(self, job_id):
         job_id = int(job_id)
@@ -290,10 +312,7 @@ class JSP_Env:
 
         self.current_op_idx[job_id] += 1
 
-        # =========================================================================
-        # 【核心修改】：去掉了遇到 processing_time 为0就直接结束任务(completed_jobs = True) 的BUG。
-        # 使得同站（O和S）转换时能够用时0分钟且合法跨越。
-        # =========================================================================
+        # 去掉了遇到 processing_time 为0就直接结束任务的BUG
         if self.current_op_idx[job_id] >= self.max_ops or \
                 self.op_machine_assign[job_id, self.current_op_idx[job_id]] == -1:
             self.completed_jobs[job_id] = True
@@ -301,24 +320,54 @@ class JSP_Env:
         done = np.all(self.completed_jobs)
 
         if not is_curr_maintenance:
-            z1_component = self.W[job_id] * (proc_time + min_stop + waiting_time)
-            z3_component = waiting_time
-            step_reward = - (z1_component + z3_component) / 100.0
+            # z1: 加权旅行时间（累计，不立即作为奖励）
+            self.episode_z1 += self.W[job_id] * (proc_time + min_stop + waiting_time)
+            # z3: 等待时间（累计）
+            self.episode_z3 += waiting_time
+
+        # ========== 密集奖励核心修改 ==========
+        # 计算当前部分makespan
+        current_partial_makespan = self.get_partial_makespan()
+
+        # 计算改进量（上一步 - 当前步，正值表示makespan减小，是改进）
+        if self.prev_partial_makespan > 0:  # 不是第一步
+            improvement = self.prev_partial_makespan - current_partial_makespan
+            # 改进为正，给予正奖励；改进为负（恶化），给予负奖励
+            dense_reward = improvement / 100.0
         else:
-            step_reward = 0
+            dense_reward = 0
 
-        reward = step_reward + step_penalty
+        # 更新上一步记录
+        self.prev_partial_makespan = current_partial_makespan
 
-        if done:
-            z2_penalty = 0.0
-            reg_deps = [self.actual_departures[j] for j in range(self.n_jobs) if j not in self.maintenance_job_ids]
-            if len(reg_deps) > 1:
-                reg_deps = np.sort(reg_deps)
-                z2_penalty = np.sum(np.abs(np.diff(reg_deps)))
+        # 组合奖励：密集奖励 + 惩罚项
+        reward = dense_reward + step_penalty
 
-            reward -= (z2_penalty / 100.0)
-
-        return self.get_state(), reward, done, {
+        # 初始化info字典
+        info = {
             'makespan': self.get_makespan(),
             'scheduled': (job_id, op_idx, machine_id, start_time, end_time) if not done else None
         }
+
+        if done:
+            # 计算z2: 发车间隔差异
+            reg_deps = [self.actual_departures[j] for j in range(self.n_jobs) if j not in self.maintenance_job_ids]
+            z2 = 0.0
+            if len(reg_deps) > 1:
+                reg_deps = np.sort(reg_deps)
+                z2 = np.sum(np.abs(np.diff(reg_deps)))
+
+            # 总makespan = z1 + z2 + z3
+            total_makespan = self.episode_z1 + z2 + self.episode_z3
+
+            # 最终奖励：用真实makespan替换密集奖励，确保与目标一致
+            final_reward = -total_makespan / 1000.0
+
+            # 可选：混合密集奖励和最终奖励
+            # reward = 0.5 * reward + 0.5 * final_reward  # 保留部分密集信号
+            reward = final_reward  # 纯最终奖励（推荐先尝试这个）
+
+            # 更新info为真实makespan
+            info['makespan'] = total_makespan
+
+        return self.get_state(), reward, done, info
